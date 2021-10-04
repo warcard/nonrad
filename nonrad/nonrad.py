@@ -233,69 +233,11 @@ def get_C(
     float, np.array(dtype=float)
         resulting capture coefficient (unscaled) in cm^3 s^{-1}
     """
+
     volume *= (1e-8)**3
-    kT = (const.k / const.e) * T    # [(J / K) * (eV / J)] * K = eV
-    Z = 1. / (1 - np.exp(-wi / kT))
+    coupling = 2 * np.pi * g * Wif**2 * volume
 
-    Ni, Nf = (17, 50)   # default values
-    tNi = np.ceil(-np.max(kT) * np.log(occ_tol) / wi).astype(int)
-    if tNi > Ni:
-        Ni = tNi
-    tNf = np.ceil((dE + Ni*wi) / wf).astype(int)
-    if tNf > Nf:
-        Nf = tNf
-
-    # warn if there are large values, can be ignored if you're confident
-    if Ni > 150 or Nf > 150:
-        warnings.warn(f'Large value for Ni, Nf encountered: ({Ni}, {Nf})',
-                      RuntimeWarning)
-
-    # precompute values of the overlap
-    ovl = np.zeros((Ni, Nf), dtype=np.longdouble)
-    for m in np.arange(Ni):
-        for n in np.arange(Nf):
-            if overlap_method.lower()[0] == 'a':
-                ovl[m, n] = analytic_overlap_NM(dQ, wi, wf, m, n)
-            elif overlap_method.lower()[0] == 'i':
-                ovl[m, n] = overlap_NM(dQ, wi, wf, m, n)
-            else:
-                raise ValueError(f'Invalid overlap method: {overlap_method}')
-
-    t = np.linspace(-Ni*wi, Nf*wf, 5000)
-    R = 0.
-    for m in np.arange(Ni-1):
-        weight_m = np.exp(-m * wi / kT) / Z
-        if sigma is None:
-            # interpolation to replace delta functions
-            E, matels = (np.zeros(Nf), np.zeros(Nf))
-            for n in np.arange(Nf):
-                if m == 0:
-                    matel = np.sqrt(Factor2 / 2 / wi) * ovl[1, n] + \
-                        np.sqrt(Factor3) * dQ * ovl[0, n]
-                else:
-                    matel = np.sqrt((m+1) * Factor2 / 2 / wi) * ovl[m+1, n] + \
-                        np.sqrt(m * Factor2 / 2 / wi) * ovl[m-1, n] + \
-                        np.sqrt(Factor3) * dQ * ovl[m, n]
-                E[n] = n*wf - m*wi
-                matels[n] = np.abs(np.conj(matel) * matel)
-            f = interp1d(E, matels, kind='cubic', bounds_error=False,
-                         fill_value=0.)
-            R = R + weight_m * (f(dE) * np.sum(matels) / np.trapz(f(t), x=t))
-        else:
-            # gaussian smearing with given sigma to replace delta functions
-            for n in np.arange(Nf):
-                # energy conservation delta function
-                delta = np.exp(-(dE+m*wi-n*wf)**2/(2.0*sigma**2)) / \
-                    (sigma*np.sqrt(2.0*np.pi))
-                if m == 0:
-                    matel = np.sqrt(Factor2 / 2 / wi) * ovl[1, n] + \
-                        np.sqrt(Factor3) * dQ * ovl[0, n]
-                else:
-                    matel = np.sqrt((m+1) * Factor2 / 2 / wi) * ovl[m+1, n] + \
-                        np.sqrt(m * Factor2 / 2 / wi) * ovl[m-1, n] + \
-                        np.sqrt(Factor3) * dQ * ovl[m, n]
-                R = R + weight_m * delta * np.abs(np.conj(matel) * matel)
-    return 2 * np.pi * g * Wif**2 * volume * R
+    return fermi_rule("get_C", coupling, dQ, dE, wi, wf, T, sigma, occ_tol, overlap_method)
 
 def get_ISC_rate(
         SO_coupling: float,
@@ -313,7 +255,7 @@ def get_ISC_rate(
 
     This function computes the first-order intersystem crossing rate according to the
     methodology of J. Smart et al., npj Comput. Mat. 7, 59 (2021). 
-    Our code assumes harmonic potential energy surfaces.
+    The code assumes harmonic potential energy surfaces.
 
     Parameters
     ----------
@@ -325,8 +267,6 @@ def get_ISC_rate(
         energy offset between the two harmonic oscillators
     wi, wf : float
         frequencies of the harmonic oscillators in eV
-    Wif : float
-        electron-phonon coupling matrix element in eV amu^{-1/2} Angstrom^{-1}
     g : int
         degeneracy factor of the final state
     T : float, np.array(dtype=float)
@@ -348,6 +288,58 @@ def get_ISC_rate(
     float, np.array(dtype=float)
         resulting crossing rate (unscaled) in s^{-1}
     """
+    coupling = 4 * np.pi * HBAR * SO_coupling**2 * g
+
+    return fermi_rule("get_ISC_rate", coupling, dQ, dE, wi, wf, T, sigma, occ_tol, overlap_method)
+
+def fermi_rule(
+        call_origin: str,
+        coupling: float,
+        dQ: float,
+        dE: float,
+        wi: float,
+        wf: float,
+        T: Union[float, np.ndarray] = 300.,
+        sigma: Optional[float] = None,
+        occ_tol: float = 1e-4,
+        overlap_method: str = 'Integral'
+) -> Union[float, np.ndarray]:
+    """Common function for calculation of rates/capture coefficients  according
+       to Fermi's rule.
+
+    Our code assumes harmonic potential energy surfaces.
+
+    Parameters
+    ----------
+    call_origin: str
+        determines which matrix element to calculate
+    coupling: float
+        coupling factor in front of matrix element (changed to fit different methods)
+    dQ : float
+        displacement between harmonic oscillators in amu^{1/2} Angstrom
+    dE : float
+        energy offset between the two harmonic oscillators
+    wi, wf : float
+        frequencies of the harmonic oscillators in eV
+    T : float, np.array(dtype=float)
+        temperature or a np.array of temperatures in K
+    sigma : None or float
+        smearing parameter in eV for replacement of the delta functions with
+        gaussians. A value of None corresponds to interpolation instead of
+        gaussian smearing. The default is None and is recommended for improved
+        accuracy.
+    occ_tol : float
+        criteria to determine the maximum quantum number for overlaps based on
+        the Bose weights
+    overlap_method : str
+        method for evaluating the overlaps (only the first letter is checked)
+        allowed values => ['Analytic', 'Integral']
+
+    Returns
+    -------
+    float, np.array(dtype=float)
+        resulting capture coefficient (unscaled) in cm^3 s^{-1}
+    """
     kT = (const.k / const.e) * T    # [(J / K) * (eV / J)] * K = eV
     Z = 1. / (1 - np.exp(-wi / kT))
 
@@ -359,7 +351,6 @@ def get_ISC_rate(
     if tNf > Nf:
         Nf = tNf
 
-    ### not sure about the purpose of this?
     # warn if there are large values, can be ignored if you're confident
     if Ni > 150 or Nf > 150:
         warnings.warn(f'Large value for Ni, Nf encountered: ({Ni}, {Nf})',
@@ -375,6 +366,26 @@ def get_ISC_rate(
                 ovl[m, n] = overlap_NM(dQ, wi, wf, m, n)
             else:
                 raise ValueError(f'Invalid overlap method: {overlap_method}')
+    
+    def C_matel(m, n, wi, wf, ovl, dQ):
+        if m == 0:
+            matel = np.sqrt(Factor2 / 2 / wi) * ovl[1, n] + \
+                    np.sqrt(Factor3) * dQ * ovl[0, n]
+        else:
+            matel = np.sqrt((m+1) * Factor2 / 2 / wi) * ovl[m+1, n] + \
+                    np.sqrt(m * Factor2 / 2 / wi) * ovl[m-1, n] + \
+                    np.sqrt(Factor3) * dQ * ovl[m, n] 
+        return matel
+
+    def SIC_matel(m, n, w_i, w_f, ovl, dQ):
+        return ovl[m,n]
+
+    if call_origin == "get_C":
+        matel_func = C_matel
+    elif call_origin == "get_ISC_rate":
+        matel_func = SIC_matel
+    else:
+        raise ValueError("Method {} not recognized fermi rule function".format(call_origin))
 
     t = np.linspace(-Ni*wi, Nf*wf, 5000)
     R = 0.
@@ -384,7 +395,7 @@ def get_ISC_rate(
             # interpolation to replace delta functions
             E, matels = (np.zeros(Nf), np.zeros(Nf))
             for n in np.arange(Nf):
-            	matel = ovl[m,n]
+                matel = matel_func(m, n, wi, wf, ovl, dQ)
                 E[n] = n*wf - m*wi
                 matels[n] = np.abs(np.conj(matel) * matel)
             f = interp1d(E, matels, kind='cubic', bounds_error=False,
@@ -396,6 +407,6 @@ def get_ISC_rate(
                 # energy conservation delta function
                 delta = np.exp(-(dE+m*wi-n*wf)**2/(2.0*sigma**2)) / \
                     (sigma*np.sqrt(2.0*np.pi))
-                matel = ovl[m, n]
+                matel = matel_func(m, n, wi, wf, ovl, dQ)
                 R = R + weight_m * delta * np.abs(np.conj(matel) * matel)
-    return 4 * np.pi * HBAR * SO_coupling**2 * g * R
+    return coupling * R
